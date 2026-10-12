@@ -34,11 +34,14 @@ interface IPredepositGuarantee is ICLProofVerifier {
      * @param stage represents validator stage in PDG flow
      * @param stakingVault pins validator to specific StakingVault
      * @param nodeOperator pins validator to specific NO
+     * @param predepositTimestamp block timestamp of the predeposit, zero if predeposited before it was tracked
+     *        or if the validator never went through the predeposit (e.g. proven as unknown validator)
      */
     struct ValidatorStatus {
         ValidatorStage stage;
         IStakingVault stakingVault;
         address nodeOperator;
+        uint64 predepositTimestamp;
     }
 
     function pendingActivations(IStakingVault _vault) external view returns (uint256);

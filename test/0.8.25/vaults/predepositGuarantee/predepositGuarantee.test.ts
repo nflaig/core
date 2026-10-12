@@ -1,5 +1,5 @@
 import { expect } from "chai";
-import { ZeroAddress } from "ethers";
+import { BytesLike, ZeroAddress } from "ethers";
 import { ethers } from "hardhat";
 
 import { HardhatEthersSigner } from "@nomicfoundation/hardhat-ethers/signers";
@@ -16,16 +16,23 @@ import { ICLProofVerifier } from "typechain-types/contracts/0.8.25/vaults/interf
 
 import {
   addressToWC,
+  advanceChainTime,
   certainAddress,
   ether,
   generateBeaconHeader,
+  generateBuilder,
+  generateBuilderWitness,
   generatePredeposit,
   generateTopUp,
   generateValidator,
   GENESIS_FORK_VERSION,
+  GENESIS_TIME,
+  getCurrentBlockTimestamp,
   prepareLocalMerkleTree,
   randomBytes32,
+  SECONDS_PER_SLOT,
   setBeaconBlockRoot,
+  SLOTS_PER_EPOCH,
   Validator,
 } from "lib";
 
@@ -67,9 +74,13 @@ describe("PredepositGuarantee.sol", () => {
     rejector = await ethers.deployContract("EthRejector");
 
     // PDG
-    pdgImpl = await ethers.deployContract("PredepositGuarantee", [GENESIS_FORK_VERSION, MAX_UINT64], {
-      from: deployer,
-    });
+    pdgImpl = await ethers.deployContract(
+      "PredepositGuarantee",
+      [GENESIS_FORK_VERSION, MAX_UINT64, SLOTS_PER_EPOCH, SECONDS_PER_SLOT, GENESIS_TIME],
+      {
+        from: deployer,
+      },
+    );
     proxy = await ethers.deployContract("OssifiableProxy", [pdgImpl, admin, new Uint8Array()], admin);
     pdg = await ethers.getContractAt("PredepositGuarantee", proxy, vaultOperator);
 
@@ -95,13 +106,34 @@ describe("PredepositGuarantee.sol", () => {
       await expect(pdgImpl.initialize(stranger)).to.be.revertedWithCustomError(pdgImpl, "InvalidInitialization");
     });
 
-    it("stores the Gloas fork slot from the constructor", async () => {
+    it("stores the Gloas fork slot and chain spec from the constructor", async () => {
       const gloasSlot = 12345n;
-      const impl = await ethers.deployContract("PredepositGuarantee", [GENESIS_FORK_VERSION, gloasSlot], {
-        from: deployer,
-      });
+      const impl = await ethers.deployContract(
+        "PredepositGuarantee",
+        [GENESIS_FORK_VERSION, gloasSlot, SLOTS_PER_EPOCH, SECONDS_PER_SLOT, GENESIS_TIME],
+        {
+          from: deployer,
+        },
+      );
 
       expect(await impl.GLOAS_SLOT()).to.equal(gloasSlot);
+      expect(await impl.SLOTS_PER_EPOCH()).to.equal(SLOTS_PER_EPOCH);
+      expect(await impl.SECONDS_PER_SLOT()).to.equal(SECONDS_PER_SLOT);
+      expect(await impl.GENESIS_TIME()).to.equal(GENESIS_TIME);
+    });
+
+    it("reverts on zero chain spec values", async () => {
+      const args = [GENESIS_FORK_VERSION, MAX_UINT64, SLOTS_PER_EPOCH, SECONDS_PER_SLOT, GENESIS_TIME];
+      for (const [position, name] of [
+        [2, "_slotsPerEpoch"],
+        [3, "_secondsPerSlot"],
+        [4, "_genesisTime"],
+      ] as const) {
+        const zeroed = args.map((arg, i) => (i === position ? 0n : arg));
+        await expect(ethers.deployContract("PredepositGuarantee", zeroed))
+          .to.be.revertedWithCustomError(pdgImpl, "ZeroArgument")
+          .withArgs(name);
+      }
     });
 
     it("reverts on `_defaultAdmin` address is zero", async () => {
@@ -1380,6 +1412,106 @@ describe("PredepositGuarantee.sol", () => {
         expect(await pdg.nodeOperatorBalance(vaultOperator)).to.deep.equal([expectedTotal, expectedLocked]);
         // disproven
         expect((await pdg.validatorStatus(invalidValidator.container.pubkey)).stage).to.equal(4n); // 4n is COMPENSATED
+      });
+    });
+
+    context("proveBuilderOnboardedAtFork", () => {
+      const GLOAS_SLOT = 64n;
+      const GLOAS_EPOCH = GLOAS_SLOT / SLOTS_PER_EPOCH;
+      const SECONDS_TO_GLOAS = 1000n;
+
+      let gloasTimestamp: bigint;
+      let validator: Validator;
+
+      const builderWitness = async (pubkey: BytesLike, depositEpoch: bigint, slot = GLOAS_SLOT) =>
+        generateBuilderWitness(generateBuilder(pubkey, { depositEpoch }), 7n, slot, await pdg.GI_BUILDERS());
+
+      beforeEach(async () => {
+        gloasTimestamp = (await getCurrentBlockTimestamp()) + SECONDS_TO_GLOAS;
+        const genesisTime = gloasTimestamp - GLOAS_SLOT * SECONDS_PER_SLOT;
+        const impl = await ethers.deployContract("PredepositGuarantee", [
+          GENESIS_FORK_VERSION,
+          GLOAS_SLOT,
+          SLOTS_PER_EPOCH,
+          SECONDS_PER_SLOT,
+          genesisTime,
+        ]);
+        await proxy.connect(admin).proxy__upgradeTo(impl);
+
+        await pdg.topUpNodeOperatorBalance(vaultOperator, { value: ether("20") });
+        await stakingVault.fund({ value: ether("32") });
+
+        validator = generateValidator(await stakingVault.withdrawalCredentials());
+        const predeposit = await generatePredeposit(validator);
+        await pdg.predeposit(stakingVault, [predeposit.deposit], [predeposit.depositY]);
+      });
+
+      it("records the predeposit timestamp", async () => {
+        const status = await pdg.validatorStatus(validator.container.pubkey);
+        expect(status.predepositTimestamp).to.equal(await getCurrentBlockTimestamp());
+        expect(status.predepositTimestamp).to.be.lessThan(gloasTimestamp);
+      });
+
+      it("compensates the vault for a predeposit absorbed by a builder onboarded at the fork", async () => {
+        const witness = await builderWitness(validator.container.pubkey, GLOAS_EPOCH - 1n);
+
+        const [total, locked] = await pdg.nodeOperatorBalance(vaultOperator);
+        const vaultBalance = await ethers.provider.getBalance(stakingVault);
+        expect(await pdg.pendingActivations(stakingVault)).to.equal(1n);
+
+        await expect(pdg.connect(stranger).proveBuilderOnboardedAtFork(witness))
+          .to.emit(pdg, "ValidatorCompensated")
+          .withArgs(stakingVault, vaultOperator, validator.container.pubkey, total - ether("1"), locked - ether("1"));
+
+        expect(await pdg.nodeOperatorBalance(vaultOperator)).to.deep.equal([total - ether("1"), locked - ether("1")]);
+        expect(await ethers.provider.getBalance(stakingVault)).to.equal(vaultBalance + ether("1"));
+        expect(await pdg.pendingActivations(stakingVault)).to.equal(0n);
+        expect((await pdg.validatorStatus(validator.container.pubkey)).stage).to.equal(4n); // 4n is COMPENSATED
+
+        await expect(pdg.connect(stranger).proveBuilderOnboardedAtFork(witness))
+          .to.be.revertedWithCustomError(pdg, "ValidatorNotPreDeposited")
+          .withArgs(validator.container.pubkey, 4n);
+      });
+
+      it("reverts if the builder was not onboarded at the fork", async () => {
+        const witness = await builderWitness(validator.container.pubkey, GLOAS_EPOCH);
+
+        await expect(pdg.proveBuilderOnboardedAtFork(witness))
+          .to.be.revertedWithCustomError(pdg, "BuilderNotOnboardedAtFork")
+          .withArgs(validator.container.pubkey, GLOAS_EPOCH);
+      });
+
+      it("reverts if the proof is against a pre-Gloas state", async () => {
+        const witness = await builderWitness(validator.container.pubkey, GLOAS_EPOCH - 1n, GLOAS_SLOT - 1n);
+
+        await expect(pdg.proveBuilderOnboardedAtFork(witness))
+          .to.be.revertedWithCustomError(pdg, "BuilderProofBeforeGloas")
+          .withArgs(GLOAS_SLOT - 1n);
+      });
+
+      it("reverts if the validator is not predeposited", async () => {
+        const notPredeposited = generateValidator(await stakingVault.withdrawalCredentials());
+        const witness = await builderWitness(notPredeposited.container.pubkey, GLOAS_EPOCH - 1n);
+
+        await expect(pdg.proveBuilderOnboardedAtFork(witness))
+          .to.be.revertedWithCustomError(pdg, "ValidatorNotPreDeposited")
+          .withArgs(notPredeposited.container.pubkey, 0n);
+      });
+
+      it("reverts if the predeposit was made after the fork", async () => {
+        await advanceChainTime(SECONDS_TO_GLOAS);
+
+        const lateValidator = generateValidator(await stakingVault.withdrawalCredentials());
+        const predeposit = await generatePredeposit(lateValidator);
+        await pdg.predeposit(stakingVault, [predeposit.deposit], [predeposit.depositY]);
+        const predepositTimestamp = await getCurrentBlockTimestamp();
+        expect(predepositTimestamp).to.be.greaterThanOrEqual(gloasTimestamp);
+
+        const witness = await builderWitness(lateValidator.container.pubkey, GLOAS_EPOCH - 1n);
+
+        await expect(pdg.proveBuilderOnboardedAtFork(witness))
+          .to.be.revertedWithCustomError(pdg, "PredepositAfterGloas")
+          .withArgs(lateValidator.container.pubkey, predepositTimestamp);
       });
     });
 

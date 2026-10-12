@@ -89,7 +89,7 @@ async function main(): Promise<void> {
 
   const predepositGuarantee = await deployContract(
     "PredepositGuarantee",
-    [genesisForkVersion, gloasForkSlot],
+    [genesisForkVersion, gloasForkSlot, slotsPerEpoch, secondsPerSlot, genesisTime],
     deployer.address,
     false,
   );

@@ -18,7 +18,7 @@ import {
   VaultHub,
 } from "typechain-types";
 
-import { GENESIS_FORK_VERSION } from "lib";
+import { GENESIS_FORK_VERSION, GENESIS_TIME, SECONDS_PER_SLOT, SLOTS_PER_EPOCH } from "lib";
 import { TOTAL_BASIS_POINTS } from "lib/constants";
 import { findEvents } from "lib/event";
 import { ether } from "lib/units";
@@ -75,6 +75,9 @@ describe("VaultHub.sol:forceExit", () => {
     predepositGuarantee = await ethers.deployContract("PredepositGuarantee__HarnessForFactory", [
       GENESIS_FORK_VERSION,
       0,
+      SLOTS_PER_EPOCH,
+      SECONDS_PER_SLOT,
+      GENESIS_TIME,
     ]);
     lazyOracle = await ethers.deployContract("LazyOracle__MockForVaultHub");
     locator = await deployLidoLocator({

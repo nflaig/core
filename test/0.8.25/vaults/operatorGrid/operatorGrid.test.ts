@@ -22,11 +22,14 @@ import {
   DISCONNECT_NOT_INITIATED,
   ether,
   GENESIS_FORK_VERSION,
+  GENESIS_TIME,
   getNextBlockTimestamp,
   impersonate,
   MAX_FEE_BP,
   MAX_RESERVE_RATIO_BP,
   MAX_UINT96,
+  SECONDS_PER_SLOT,
+  SLOTS_PER_EPOCH,
 } from "lib";
 
 import { deployLidoLocator, updateLidoLocatorImplementation } from "test/deploy";
@@ -99,6 +102,9 @@ describe("OperatorGrid.sol", () => {
     predepositGuarantee = await ethers.deployContract("PredepositGuarantee__HarnessForFactory", [
       GENESIS_FORK_VERSION,
       0,
+      SLOTS_PER_EPOCH,
+      SECONDS_PER_SLOT,
+      GENESIS_TIME,
     ]);
 
     locator = await deployLidoLocator({ lido: steth, wstETH: wsteth, predepositGuarantee });

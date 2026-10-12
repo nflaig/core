@@ -17,7 +17,16 @@ import {
   VaultHub,
 } from "typechain-types";
 
-import { advanceChainTime, days, ether, getCurrentBlockTimestamp, impersonate } from "lib";
+import {
+  advanceChainTime,
+  days,
+  ether,
+  GENESIS_TIME,
+  getCurrentBlockTimestamp,
+  impersonate,
+  SECONDS_PER_SLOT,
+  SLOTS_PER_EPOCH,
+} from "lib";
 import { ONE_GWEI, TOTAL_BASIS_POINTS } from "lib/constants";
 import { findEvents } from "lib/event";
 import { ceilDiv } from "lib/protocol";
@@ -116,6 +125,9 @@ describe("VaultHub.sol:owner-functions", () => {
     predepositGuarantee = await ethers.deployContract("PredepositGuarantee__HarnessForFactory", [
       "0x00000000", // GENESIS_FORK_VERSION
       0,
+      SLOTS_PER_EPOCH,
+      SECONDS_PER_SLOT,
+      GENESIS_TIME,
     ]);
 
     // Deploy Lido

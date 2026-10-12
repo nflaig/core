@@ -99,6 +99,30 @@ abstract contract CLProofVerifier is ICLProofVerifier {
     ///      proof takes the pre-Gloas path; `0` means Gloas is active from genesis.
     uint64 public immutable GLOAS_SLOT;
 
+    /**  GIndex of builder in state tree is calculated the same way as for validators.
+     *   `BeaconState.builders` is a ProgressiveList[Builder] that only exists starting from Gloas.
+     *
+     *   Scheme of Builder Container Tree:
+     *
+                            Builder Container Root                                       **DEPTH = 0
+                                        │
+                        ┌───────────────┴───────────────┐
+                        │                               │
+                      node                            node                               **DEPTH = 1
+                        │                               │
+                ┌───────┴───────┐               ┌───────┴───────┐
+                │               │               │               │
+              node            node            node             node                     **DEPTH = 2
+                │               │               │               │
+          ┌─────┴─────┐   ┌─────┴─────┐   ┌─────┴─────┐   ┌─────┴─────┐
+          │           │   │           │   │           │   │           │
+     [pubkeyRoot] [version] [EA]  [balance] [DE]       [WE] [0]         [0]             **DEPTH = 3
+    */
+
+    /// @notice GIndex of the builders field in CL state tree starting from Gloas.
+    /// @dev This index is relative to a state like: `BeaconState.builders`.
+    GIndex public constant GI_BUILDERS = CLGIndices.BUILDERS;
+
     /**
      *   GIndex of stateRoot in BeaconBlockHeader is
      *   unlikely to change and same between mainnet/testnets
@@ -156,7 +180,7 @@ abstract contract CLProofVerifier is ICLProofVerifier {
     ) internal view {
         // verifies user provided slot against user provided proof
         // proof verification is done in `SSZ.verifyProof` and is not affected by slot
-        _verifySlot(_witness);
+        _verifySlot(_witness.proof, _witness.slot, _witness.proposerIndex);
 
         // parent node for first two leaves in validator container tree: pubkey & wc
         // we use 'leaf' instead of 'node' due to proving a subtree where this node is a leaf
@@ -178,19 +202,76 @@ abstract contract CLProofVerifier is ICLProofVerifier {
     }
 
     /**
+     * @notice validates proof of builder in CL with all of its fields against Beacon block root
+     * @param _witness object containing user input passed as calldata
+     *  `proof` - array of hashes for concatenated merkle proof from Builder container root to the Beacon block root
+     *  `pubkey`, `version`, `executionAddress`, `balance`, `depositEpoch`, `withdrawableEpoch` - builder fields
+     *  `builderIndex` - numerical index of builder in CL
+     *  `childBlockTimestamp` - timestamp of EL block that has Beacon root corresponding to proof
+     *  `slot` - slot of the Beacon block that has the state root
+     *  `proposerIndex` - proposer index of the Beacon block that has the state root
+     * @dev reverts with `BuilderProofBeforeGloas` if the proven Beacon block is before Gloas
+     * @dev reverts with `InvalidProof` when provided input cannot be proven to Beacon block root
+     */
+    function _validateBuilderProof(BuilderWitness calldata _witness) internal view {
+        // builders registry only exists starting from Gloas
+        if (_witness.slot < GLOAS_SLOT) revert BuilderProofBeforeGloas(_witness.slot);
+
+        _verifySlot(_witness.proof, _witness.slot, _witness.proposerIndex);
+
+        // concatenated GIndex for
+        // Builder Index in state tree -> stateView Index in Beacon block Tree
+        GIndex gIndex = concat(GI_STATE_ROOT, GI_BUILDERS.concat(progressiveListNodeGIndex(_witness.builderIndex)));
+
+        SSZ.verifyProof({
+            proof: _witness.proof,
+            root: _getParentBlockRoot(_witness.childBlockTimestamp),
+            leaf: _builderHashTreeRoot(_witness),
+            gI: gIndex
+        });
+    }
+
+    /**
      * @notice returns parent CL block root for given child block timestamp
-     * @param _witness object containing proof, slot and proposerIndex
+     * @param _proof concatenated merkle proof to the Beacon block root
+     * @param _slot of the Beacon block for which the proof is generated
+     * @param _proposerIndex of the Beacon block for which the proof is generated
      * @dev checks slot and proposerIndex against proof[:-2] which later is verified against Beacon block root
      * This is a trivial case of multi Merkle proofs where a short proof branch proves slot
      */
-    function _verifySlot(ValidatorWitness calldata _witness) internal view {
+    function _verifySlot(bytes32[] calldata _proof, uint64 _slot, uint64 _proposerIndex) internal view {
         bytes32 parentSlotProposer = BLS12_381.sha256Pair(
-            SSZ.toLittleEndian(_witness.slot),
-            SSZ.toLittleEndian(_witness.proposerIndex)
+            SSZ.toLittleEndian(_slot),
+            SSZ.toLittleEndian(_proposerIndex)
         );
-        if (_witness.proof[_witness.proof.length - SLOT_PROPOSER_PARENT_PROOF_OFFSET] != parentSlotProposer) {
+        if (_proof[_proof.length - SLOT_PROPOSER_PARENT_PROOF_OFFSET] != parentSlotProposer) {
             revert InvalidSlot();
         }
+    }
+
+    /**
+     * @notice computes SSZ hash_tree_root(Builder) from witness fields
+     * @param _witness object containing builder fields
+     * @return root of the Builder container
+     */
+    function _builderHashTreeRoot(BuilderWitness calldata _witness) internal view returns (bytes32) {
+        bytes32 l1a = BLS12_381.sha256Pair(
+            BLS12_381.pubkeyRoot(_witness.pubkey),
+            SSZ.toLittleEndian(_witness.version)
+        );
+        // `execution_address` is Bytes20, left-aligned in its 32 bytes chunk
+        bytes32 l1b = BLS12_381.sha256Pair(
+            bytes32(bytes20(_witness.executionAddress)),
+            SSZ.toLittleEndian(_witness.balance)
+        );
+        bytes32 l1c = BLS12_381.sha256Pair(
+            SSZ.toLittleEndian(_witness.depositEpoch),
+            SSZ.toLittleEndian(_witness.withdrawableEpoch)
+        );
+        // two trailing zero chunks pad the container to 8 leaves
+        bytes32 l1d = BLS12_381.sha256Pair(bytes32(0), bytes32(0));
+
+        return BLS12_381.sha256Pair(BLS12_381.sha256Pair(l1a, l1b), BLS12_381.sha256Pair(l1c, l1d));
     }
 
     /**
@@ -224,4 +305,5 @@ abstract contract CLProofVerifier is ICLProofVerifier {
 
     error InvalidSlot();
     error RootNotFound();
+    error BuilderProofBeforeGloas(uint64 slot);
 }

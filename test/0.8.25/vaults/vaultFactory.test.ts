@@ -20,7 +20,7 @@ import {
   WstETH__Harness,
 } from "typechain-types";
 
-import { days, ether, GENESIS_FORK_VERSION, randomAddress } from "lib";
+import { days, ether, GENESIS_FORK_VERSION, GENESIS_TIME, randomAddress, SECONDS_PER_SLOT, SLOTS_PER_EPOCH } from "lib";
 import { createVaultProxy } from "lib/protocol/helpers";
 import { createVaultProxyWithoutConnectingToVaultHub } from "lib/protocol/helpers/vaults";
 
@@ -69,6 +69,9 @@ describe("VaultFactory.sol", () => {
     predepositGuarantee = await ethers.deployContract("PredepositGuarantee__HarnessForFactory", [
       GENESIS_FORK_VERSION,
       0,
+      SLOTS_PER_EPOCH,
+      SECONDS_PER_SLOT,
+      GENESIS_TIME,
     ]);
 
     lazyOracle = await ethers.deployContract("LazyOracle__MockForNodeOperatorFee");

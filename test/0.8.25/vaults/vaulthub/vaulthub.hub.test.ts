@@ -28,8 +28,11 @@ import {
   ether,
   findEvents,
   GENESIS_FORK_VERSION,
+  GENESIS_TIME,
   getCurrentBlockTimestamp,
   impersonate,
+  SECONDS_PER_SLOT,
+  SLOTS_PER_EPOCH,
 } from "lib";
 import { DISCONNECT_NOT_INITIATED, MAX_UINT256, TOTAL_BASIS_POINTS } from "lib/constants";
 import { ceilDiv } from "lib/protocol";
@@ -148,6 +151,9 @@ describe("VaultHub.sol:hub", () => {
     predepositGuarantee = await ethers.deployContract("PredepositGuarantee__HarnessForFactory", [
       GENESIS_FORK_VERSION,
       0,
+      SLOTS_PER_EPOCH,
+      SECONDS_PER_SLOT,
+      GENESIS_TIME,
     ]);
 
     ({ lido, acl } = await deployLidoDao({
