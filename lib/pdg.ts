@@ -1,4 +1,13 @@
-import { BigNumberish, hexlify, parseUnits, randomBytes, zeroPadBytes, zeroPadValue } from "ethers";
+import {
+  BigNumberish,
+  BytesLike,
+  getBytes,
+  hexlify,
+  parseUnits,
+  randomBytes,
+  zeroPadBytes,
+  zeroPadValue,
+} from "ethers";
 import { ethers } from "hardhat";
 
 import { PublicKey, SecretKey, Signature, verify } from "@chainsafe/blst";
@@ -6,6 +15,7 @@ import { PublicKey, SecretKey, Signature, verify } from "@chainsafe/blst";
 import { IStakingVault, SSZBLSHelpers, SSZMerkleTree } from "typechain-types";
 import {
   BLS12_381,
+  ICLProofVerifier,
   PredepositGuarantee,
 } from "typechain-types/contracts/0.8.25/vaults/predeposit_guarantee/PredepositGuarantee";
 
@@ -316,6 +326,109 @@ export const prepareLocalMerkleTree = async (
     validatorAtIndex,
     commitChangesToBeaconRoot,
     buildProof,
+  };
+};
+
+/**
+ * Position of `BeaconState.builders` in the Gloas `ProgressiveContainer`.
+ */
+export const GLOAS_BUILDERS_FIELD_POSITION = 38n;
+
+/**
+ * Generalized index of the ith chunk of a progressive merkle tree (EIP-7916) relative to the root of the
+ * `ProgressiveList` or `ProgressiveContainer`. Both root as `hash(progressive_root, mix_in)`, and every level of
+ * `merkleize_progressive` hashes `(subtree of the next 4^k chunks, rest of the chunks)`.
+ */
+export const progressiveNodeGIndex = (i: bigint): bigint => {
+  let gI = 2n;
+  let chunkSize = 1n;
+  let depth = 0n;
+  while (i >= chunkSize) {
+    i -= chunkSize;
+    gI = gI * 2n + 1n;
+    chunkSize *= 4n;
+    depth += 2n;
+  }
+  return ((gI * 2n) << depth) + i;
+};
+
+export const concatGIndex = (lhs: bigint, rhs: bigint): bigint => {
+  const rhsDepth = BigInt(rhs.toString(2).length - 1);
+  return (lhs << rhsDepth) | (rhs ^ (1n << rhsDepth));
+};
+
+export type Builder = {
+  pubkey: BytesLike;
+  version: number;
+  executionAddress: string;
+  balance: bigint;
+  depositEpoch: bigint;
+  withdrawableEpoch: bigint;
+};
+
+export const generateBuilder = (pubkey: BytesLike, overrides: Partial<Builder> = {}): Builder => ({
+  pubkey,
+  version: 0,
+  executionAddress: hexlify(randomBytes(20)),
+  balance: 2_000_000_000n,
+  depositEpoch: 0n,
+  withdrawableEpoch: FAR_FUTURE_EPOCH,
+  ...overrides,
+});
+
+export const builderHashTreeRoot = async (builder: Builder): Promise<string> => {
+  // ssz ESM is not compatible with require
+  const { ByteVectorType, ContainerType, UintBigintType, UintNumberType } = await eval(`import("@chainsafe/ssz")`);
+
+  const BuilderType = new ContainerType({
+    pubkey: new ByteVectorType(48),
+    version: new UintNumberType(1),
+    executionAddress: new ByteVectorType(20),
+    balance: new UintBigintType(8),
+    depositEpoch: new UintBigintType(8),
+    withdrawableEpoch: new UintBigintType(8),
+  });
+
+  return hexlify(
+    BuilderType.hashTreeRoot({
+      ...builder,
+      pubkey: getBytes(builder.pubkey),
+      executionAddress: getBytes(builder.executionAddress),
+    }),
+  );
+};
+
+/**
+ * Builds a witness for `state.builders[builderIndex]` of a Gloas state, where `buildersGIndex` is the
+ * generalized index of the `BeaconState.builders` field, e.g. `GI_BUILDERS` of the verifiers.
+ */
+export const generateBuilderWitness = async (
+  builder: Builder,
+  builderIndex: bigint,
+  slot: bigint,
+  buildersGIndex: bigint,
+): Promise<ICLProofVerifier.BuilderWitnessStruct> => {
+  const builderGIndex = concatGIndex(buildersGIndex, progressiveNodeGIndex(builderIndex));
+  const sszMerkleTree: SSZMerkleTree = await ethers.deployContract("SSZMerkleTree", [builderGIndex], {});
+
+  const leafIndex = await sszMerkleTree.leafCount();
+  await sszMerkleTree.addLeaf(await builderHashTreeRoot(builder));
+  if ((await sszMerkleTree.getGeneralizedIndex(leafIndex)) !== builderGIndex) {
+    throw new Error("Invariant: sszMerkleTree implementation is broken");
+  }
+
+  const stateProof = await sszMerkleTree.getMerkleProof(leafIndex);
+  const beaconHeader = generateBeaconHeader(await sszMerkleTree.getMerkleRoot(), Number(slot));
+  const beaconMerkle = await sszMerkleTree.getBeaconBlockHeaderProof(beaconHeader);
+  const childBlockTimestamp = await setBeaconBlockRoot(beaconMerkle.root);
+
+  return {
+    ...builder,
+    proof: [...stateProof, ...beaconMerkle.proof],
+    builderIndex,
+    childBlockTimestamp,
+    slot: beaconHeader.slot,
+    proposerIndex: beaconHeader.proposerIndex,
   };
 };
 

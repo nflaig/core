@@ -27,6 +27,8 @@ library CLGIndices {
     GIndex internal constant VALIDATORS = GIndex.wrap(0x166);
     /// @dev `BeaconState.historical_summaries`.
     GIndex internal constant HISTORICAL_SUMMARIES = GIndex.wrap(0xb86);
+    /// @dev `BeaconState.builders`, introduced in Gloas.
+    GIndex internal constant BUILDERS = GIndex.wrap(0xb91);
 
     /// @dev `HistoricalSummary.block_summary_root`, the block roots vector root.
     ///      `HistoricalSummary` is a plain container whose layout does not vary across forks.

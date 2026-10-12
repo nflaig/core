@@ -83,6 +83,9 @@ export async function main() {
   const predepositGuaranteeConstructorArgs: ConstructorArgs<PredepositGuarantee__factory> = [
     parameters.predepositGuarantee.genesisForkVersion,
     parameters.predepositGuarantee.gloasSlot,
+    chainSpec.slotsPerEpoch,
+    chainSpec.secondsPerSlot,
+    chainSpec.genesisTime,
   ];
 
   const topUpGatewayConstructorArgs: ConstructorArgs<TopUpGateway__factory> = [

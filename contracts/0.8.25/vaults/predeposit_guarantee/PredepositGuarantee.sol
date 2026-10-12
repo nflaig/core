@@ -134,6 +134,10 @@ contract PredepositGuarantee is IPredepositGuarantee, CLProofVerifier, PausableU
      */
     bytes32 public immutable DEPOSIT_DOMAIN;
 
+    uint64 public immutable SLOTS_PER_EPOCH;
+    uint64 public immutable SECONDS_PER_SLOT;
+    uint64 public immutable GENESIS_TIME;
+
     /**
      * @notice Storage offset slot for ERC-7201 namespace
      *         The storage namespace is used to prevent upgrade collisions
@@ -145,12 +149,25 @@ contract PredepositGuarantee is IPredepositGuarantee, CLProofVerifier, PausableU
     /**
      * @param _genesisForkVersion genesis fork version for the current chain
      * @param _gloasSlot first slot of the Gloas fork
+     * @param _slotsPerEpoch number of slots per epoch on the current chain
+     * @param _secondsPerSlot number of seconds per slot on the current chain
+     * @param _genesisTime genesis time of the current chain
      */
     constructor(
         bytes4 _genesisForkVersion,
-        uint64 _gloasSlot
+        uint64 _gloasSlot,
+        uint64 _slotsPerEpoch,
+        uint64 _secondsPerSlot,
+        uint64 _genesisTime
     ) CLProofVerifier(_gloasSlot) {
+        if (_slotsPerEpoch == 0) revert ZeroArgument("_slotsPerEpoch");
+        if (_secondsPerSlot == 0) revert ZeroArgument("_secondsPerSlot");
+        if (_genesisTime == 0) revert ZeroArgument("_genesisTime");
+
         DEPOSIT_DOMAIN = BLS12_381.computeDepositDomain(_genesisForkVersion);
+        SLOTS_PER_EPOCH = _slotsPerEpoch;
+        SECONDS_PER_SLOT = _secondsPerSlot;
+        GENESIS_TIME = _genesisTime;
         _disableInitializers();
         _pauseUntil(PAUSE_INFINITELY);
     }
@@ -434,7 +451,8 @@ contract PredepositGuarantee is IPredepositGuarantee, CLProofVerifier, PausableU
             validatorByPubkey[_deposit.pubkey] = ValidatorStatus({
                 stage: ValidatorStage.PREDEPOSITED,
                 stakingVault: _stakingVault,
-                nodeOperator: nodeOperator
+                nodeOperator: nodeOperator,
+                predepositTimestamp: uint64(block.timestamp)
             });
 
             _stakingVault.depositToBeaconChain(_deposit);
@@ -560,43 +578,59 @@ contract PredepositGuarantee is IPredepositGuarantee, CLProofVerifier, PausableU
     ) external whenResumed {
         _validatePubKeyWCProof(_witness, _invalidWithdrawalCredentials);
 
-        ERC7201Storage storage $ = _storage();
-        ValidatorStatus storage validator = $.validatorStatus[_witness.pubkey];
+        ValidatorStatus storage validator = _storage().validatorStatus[_witness.pubkey];
 
         // validator state and WC incorrectness are enforced inside
         if (validator.stage != ValidatorStage.PREDEPOSITED) {
             revert ValidatorNotPreDeposited(_witness.pubkey, validator.stage);
         }
 
-        IStakingVault stakingVault = validator.stakingVault;
-        bytes32 vaultWithdrawalCredentials = _checkVaultWC(stakingVault);
+        bytes32 vaultWithdrawalCredentials = _checkVaultWC(validator.stakingVault);
 
         // this check prevents negative proving for legit deposits
         if (_invalidWithdrawalCredentials == vaultWithdrawalCredentials) {
             revert WithdrawalCredentialsMatch();
         }
 
-        // immediately compensate the staking vault
-        validator.stage = ValidatorStage.COMPENSATED;
+        _compensatePredeposit(validator, _witness.pubkey);
+    }
 
-        address nodeOperator = validator.nodeOperator;
+    /**
+     * @notice permissionless method to prove that validator predeposit was absorbed by a builder onboarded at the
+     *         Gloas fork and to compensate the vault from the locked guarantee balance
+     * @param _witness object containing builder fields, Merkle proof and timestamp for Beacon Block root child block
+     * @dev At the Gloas fork, `onboard_builders_from_pending_deposits` turns a pending deposit with builder
+     *      withdrawal credentials for a new pubkey into a builder and adds every later pending deposit for the
+     *      same pubkey to the builder balance, regardless of withdrawal credentials. A predeposit queued behind
+     *      such deposit never creates a validator, so it can't be disproven with `proveInvalidValidatorWC`.
+     * @dev Only builders onboarded at the fork have a deposit epoch before the Gloas fork epoch, as it is
+     *      derived from the slot of the pending deposit, every other builder gets the epoch of the deposit request.
+     * @dev Predeposits after the fork are never added to a builder as validator and builder deposits are
+     *      processed separately, predeposits recorded without a timestamp were made before this check existed.
+     * @dev will revert if proof is invalid, builder was not onboarded at the fork, predeposit was made after the fork
+     *      or validator is not predeposited
+     * @dev transition PREDEPOSITED => COMPENSATED
+     */
+    function proveBuilderOnboardedAtFork(BuilderWitness calldata _witness) external whenResumed {
+        _validateBuilderProof(_witness);
 
-        // reduces total&locked NO balance
-        NodeOperatorBalance storage balance = $.nodeOperatorBalance[nodeOperator];
-        balance.total -= PREDEPOSIT_AMOUNT;
-        balance.locked -= PREDEPOSIT_AMOUNT;
-        $.pendingActivations[address(stakingVault)] -= 1;
-
-        // unlocking the staged amount if possible as we are not activating this validator
-        if (stakingVault.depositor() == address(this) && stakingVault.stagedBalance() >= ACTIVATION_DEPOSIT_AMOUNT) {
-            stakingVault.unstage(ACTIVATION_DEPOSIT_AMOUNT);
+        uint256 gloasEpoch = GLOAS_SLOT / SLOTS_PER_EPOCH;
+        if (_witness.depositEpoch >= gloasEpoch) {
+            revert BuilderNotOnboardedAtFork(_witness.pubkey, _witness.depositEpoch);
         }
 
-        // transfer the compensation directly to the vault
-        (bool success, ) = address(stakingVault).call{value: PREDEPOSIT_AMOUNT}("");
-        if (!success) revert CompensateFailed();
+        ValidatorStatus storage validator = _storage().validatorStatus[_witness.pubkey];
 
-        emit ValidatorCompensated(address(stakingVault), nodeOperator, _witness.pubkey, balance.total, balance.locked);
+        if (validator.stage != ValidatorStage.PREDEPOSITED) {
+            revert ValidatorNotPreDeposited(_witness.pubkey, validator.stage);
+        }
+
+        uint256 gloasTimestamp = GENESIS_TIME + uint256(GLOAS_SLOT) * SECONDS_PER_SLOT;
+        if (validator.predepositTimestamp >= gloasTimestamp) {
+            revert PredepositAfterGloas(_witness.pubkey, validator.predepositTimestamp);
+        }
+
+        _compensatePredeposit(validator, _witness.pubkey);
     }
 
     /**
@@ -719,6 +753,37 @@ contract PredepositGuarantee is IPredepositGuarantee, CLProofVerifier, PausableU
 
         emit BalanceUnlocked(_nodeOperator, balance.total, balance.locked);
         emit ValidatorProven(_witness.pubkey, _nodeOperator, address(_vault), _withdrawalCredentials);
+    }
+
+    /**
+     * @dev compensates the staking vault for the lost predeposit from the locked NO guarantee
+     * @dev transition PREDEPOSITED => COMPENSATED
+     */
+    function _compensatePredeposit(ValidatorStatus storage _validator, bytes calldata _pubkey) internal {
+        ERC7201Storage storage $ = _storage();
+
+        // immediately compensate the staking vault
+        _validator.stage = ValidatorStage.COMPENSATED;
+
+        IStakingVault stakingVault = _validator.stakingVault;
+        address nodeOperator = _validator.nodeOperator;
+
+        // reduces total&locked NO balance
+        NodeOperatorBalance storage balance = $.nodeOperatorBalance[nodeOperator];
+        balance.total -= PREDEPOSIT_AMOUNT;
+        balance.locked -= PREDEPOSIT_AMOUNT;
+        $.pendingActivations[address(stakingVault)] -= 1;
+
+        // unlocking the staged amount if possible as we are not activating this validator
+        if (stakingVault.depositor() == address(this) && stakingVault.stagedBalance() >= ACTIVATION_DEPOSIT_AMOUNT) {
+            stakingVault.unstage(ACTIVATION_DEPOSIT_AMOUNT);
+        }
+
+        // transfer the compensation directly to the vault
+        (bool success, ) = address(stakingVault).call{value: PREDEPOSIT_AMOUNT}("");
+        if (!success) revert CompensateFailed();
+
+        emit ValidatorCompensated(address(stakingVault), nodeOperator, _pubkey, balance.total, balance.locked);
     }
 
     function _activateAndTopUpValidator(
@@ -932,6 +997,8 @@ contract PredepositGuarantee is IPredepositGuarantee, CLProofVerifier, PausableU
     error WithdrawalCredentialsMisformed(bytes32 withdrawalCredentials);
     error WithdrawalCredentialsInvalidVersion(uint8 version);
     error ValidatorNotEligibleForActivation(bytes validatorPubkey);
+    error BuilderNotOnboardedAtFork(bytes builderPubkey, uint64 depositEpoch);
+    error PredepositAfterGloas(bytes validatorPubkey, uint64 predepositTimestamp);
 
     // compensate
     error CompensateFailed();

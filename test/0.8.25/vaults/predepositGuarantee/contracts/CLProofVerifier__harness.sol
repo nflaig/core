@@ -23,4 +23,14 @@ contract CLProofVerifier__Harness is CLProofVerifier {
     function TEST_getValidatorGI(uint256 offset, uint64 slot) public view returns (GIndex) {
         return _getValidatorGI(offset, slot);
     }
+
+    function TEST_validateBuilderProof(IPredepositGuarantee.BuilderWitness calldata _witness) public view {
+        _validateBuilderProof(_witness);
+    }
+
+    function TEST_builderHashTreeRoot(
+        IPredepositGuarantee.BuilderWitness calldata _witness
+    ) public view returns (bytes32) {
+        return _builderHashTreeRoot(_witness);
+    }
 }

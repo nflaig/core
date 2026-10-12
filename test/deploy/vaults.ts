@@ -13,7 +13,17 @@ import {
 } from "typechain-types";
 import { TierParamsStruct } from "typechain-types/contracts/0.8.25/vaults/OperatorGrid";
 
-import { certainAddress, ether, findEvents, GENESIS_FORK_VERSION, impersonate, TOTAL_BASIS_POINTS } from "lib";
+import {
+  certainAddress,
+  ether,
+  findEvents,
+  GENESIS_FORK_VERSION,
+  GENESIS_TIME,
+  impersonate,
+  SECONDS_PER_SLOT,
+  SLOTS_PER_EPOCH,
+  TOTAL_BASIS_POINTS,
+} from "lib";
 
 import { deployLidoDao, updateLidoLocatorImplementation } from "test/deploy";
 import { VAULTS_MAX_RELATIVE_SHARE_LIMIT_BP } from "test/suite";
@@ -120,6 +130,9 @@ export async function deployVaults({ deployer, admin }: VaultsConfig) {
   const predepositGuarantee = await ethers.deployContract("PredepositGuarantee__HarnessForFactory", [
     GENESIS_FORK_VERSION,
     0,
+    SLOTS_PER_EPOCH,
+    SECONDS_PER_SLOT,
+    GENESIS_TIME,
   ]);
 
   const { lido, acl } = await deployLidoDao({

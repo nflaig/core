@@ -6,9 +6,14 @@ import { mine } from "@nomicfoundation/hardhat-network-helpers";
 import { CLProofVerifier__Harness, SSZMerkleTree } from "typechain-types";
 
 import {
+  builderHashTreeRoot,
   generateBeaconHeader,
+  generateBuilder,
+  generateBuilderWitness,
   generateValidator,
+  GLOAS_BUILDERS_FIELD_POSITION,
   prepareLocalMerkleTree,
+  progressiveNodeGIndex,
   randomBytes32,
   setBeaconBlockRoot,
 } from "lib";
@@ -219,5 +224,74 @@ describe("CLProofVerifier.sol", () => {
         provenValidator.container.withdrawalCredentials,
       ),
     ).to.be.revertedWithCustomError(CLProofVerifier, "InvalidSlot");
+  });
+
+  context("builder proofs", () => {
+    const gloasSlot = 1000n;
+    const SSZ = { interface: ethers.Interface.from(["error InvalidProof()"]) };
+
+    let verifier: CLProofVerifier__Harness;
+    let buildersGIndex: bigint;
+
+    before(async () => {
+      verifier = await ethers.deployContract("CLProofVerifier__Harness", [gloasSlot], {});
+      buildersGIndex = await verifier.GI_BUILDERS();
+    });
+
+    it("locates the builders field in the Gloas state", async () => {
+      expect(await verifier.GI_VALIDATORS()).to.equal(progressiveNodeGIndex(11n));
+      expect(buildersGIndex).to.equal(progressiveNodeGIndex(GLOAS_BUILDERS_FIELD_POSITION));
+    });
+
+    it("computes the SSZ hash tree root of the builder", async () => {
+      const builder = generateBuilder(generateValidator().container.pubkey, {
+        version: 1,
+        balance: 123456789n,
+        depositEpoch: 1234n,
+        withdrawableEpoch: 5678n,
+      });
+      const witness = await generateBuilderWitness(builder, 0n, gloasSlot, buildersGIndex);
+
+      expect(await verifier.TEST_builderHashTreeRoot(witness)).to.equal(await builderHashTreeRoot(builder));
+    });
+
+    it("validates builder proofs against a Gloas state", async () => {
+      for (const builderIndex of [0n, 1n, 4n, 5n, 21n, 1000n]) {
+        const builder = generateBuilder(generateValidator().container.pubkey);
+        const witness = await generateBuilderWitness(builder, builderIndex, gloasSlot + builderIndex, buildersGIndex);
+        await verifier.TEST_validateBuilderProof(witness);
+      }
+    });
+
+    it("reverts builder proofs against a pre-Gloas state", async () => {
+      const builder = generateBuilder(generateValidator().container.pubkey);
+      const witness = await generateBuilderWitness(builder, 0n, gloasSlot - 1n, buildersGIndex);
+
+      await expect(verifier.TEST_validateBuilderProof(witness))
+        .to.be.revertedWithCustomError(verifier, "BuilderProofBeforeGloas")
+        .withArgs(gloasSlot - 1n);
+    });
+
+    it("reverts if any builder field does not match the proof", async () => {
+      const builder = generateBuilder(generateValidator().container.pubkey, { depositEpoch: 10n });
+      const witness = await generateBuilderWitness(builder, 1n, gloasSlot, buildersGIndex);
+      await verifier.TEST_validateBuilderProof(witness);
+
+      const tampered = [
+        { pubkey: generateValidator().container.pubkey },
+        { builderIndex: 2n },
+        { version: 1 },
+        { executionAddress: randomBytes32().slice(0, 42) },
+        { balance: builder.balance + 1n },
+        { depositEpoch: builder.depositEpoch - 1n },
+        { withdrawableEpoch: 0n },
+      ];
+      for (const override of tampered) {
+        await expect(verifier.TEST_validateBuilderProof({ ...witness, ...override })).to.be.revertedWithCustomError(
+          SSZ,
+          "InvalidProof",
+        );
+      }
+    });
   });
 });
